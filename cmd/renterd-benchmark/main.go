@@ -1,140 +1,370 @@
 package main
 
 import (
-	"errors"
+	"bytes"
+	"context"
 	"flag"
-	"io/ioutil"
+	"fmt"
+	"io"
 	"log"
-	"os"
-	"path/filepath"
+	"math"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
+	"github.com/montanaflynn/stats"
 	"go.sia.tech/renterd/api"
+	"go.sia.tech/renterd/bus"
+	"go.sia.tech/renterd/worker"
+	"lukechampine.com/frand"
 )
 
 type (
 	flags struct {
-		contracts        int
-		dataDir          string
-		files            int
-		minShards        uint
-		numShards        uint
-		renterdAddr      string
-		renterdPassword  string
-		renterdRenterKey api.PrivateKey
+		id          string
+		numFiles    int
+		filesize    int64
+		minShards   int
+		totalShards int
+		dlThreads   []int
+		ulThreads   int
+		bgUploads   bool
+
+		workerAddresses []string
+		workerPasswords []string
+
+		busAddress  string
+		busPassword string
 	}
 )
 
-func main() {
-	params, newKey := parseFlags()
-
-	printHeader("renterd benchmark tool")
-	if newKey {
-		log.Println("- generated random key file")
-	}
-	log.Printf("- min shards %v", params.minShards)
-	log.Printf("- num shards %v", params.numShards)
-	log.Printf("- min contracts %v", params.contracts)
-	log.Printf("- files %v", params.files)
-
-	printHeader("client")
-	c := api.NewClient(params.renterdAddr, params.renterdPassword)
-
-	// ensure we have money
-	bal, err := c.WalletBalance()
-	checkFatal("failed fetching wallet balance", err)
-	checkFatalB("no funds in wallet", bal.IsZero())
-	log.Println("- wallet balance", bal.HumanString())
-
-	// print the wallet outputs
-	utxos, err := c.WalletOutputs()
-	checkFatal("failed fetching wallet outputs", err)
-	log.Println("- wallet outputs", len(utxos))
-
-	// ensure we have contracts
-	printHeader("contracts")
-	contracts, err := ensureContracts(c, params.renterdRenterKey, params.contracts)
-	checkFatal("failed ensuring contracts", err)
-	log.Printf("- found %v usable contracts\n", len(contracts))
-
-	// ensure we have test files
-	printHeader("dataset")
-	dataset, err := ensureDataset(c, contracts, params.renterdRenterKey, params.dataDir, params.files, uint8(params.minShards), uint8(params.numShards))
-	checkFatal("failed ensuring data set", err)
-	log.Printf("- found %v usable files\n", len(dataset))
-
-	// run the benchmark
-	printHeader("benchmark")
-	for _, tc := range []uint8{1, 4, 16, 64} {
-		timings, _ := downloadDataset(c, contracts, dataset, tc)
-		log.Println(getPercentilesString(timings))
-	}
-}
-
-func parseFlags() (flags, bool) {
+func parseFlags() flags {
 	log.SetFlags(0)
-	contracts := flag.Int("contracts", 20, "number of contracts")
-	dataDir := flag.String("data-dir", "data", "data directory")
-	files := flag.Int("files", 50, "number of files in dataset")
-	minShards := flag.Uint("min-shards", 2, "number of min shards")
-	numShards := flag.Uint("num-shards", 5, "number of shards")
-	renterdAddr := flag.String("addr", "http://127.0.0.1:9980/api", "renterd address")
-	renterdPassword := flag.String("password", "test", "renterd API password")
+
+	// benchmark settings
+	id := flag.String("id", "renterd-benchmark", "benchmark identifier")
+	fileSize := flag.Int("fileSize", 40<<20, "size of files to upload")
+	numFiles := flag.Int("numFiles", 100, "number of files in the dataset")
+	ulThreads := flag.Int("uploaderThreads", 1, "number of threads the uploader uses")
+	dlThreadsStr := flag.String("threads", "1,4,16", "comma separated list of thread counts")
+	bgUploads := flag.Bool("bgUploads", false, "upload small files in the background while performing download benchmarks")
+	minShards := flag.Int("minShards", api.DefaultRedundancySettings.MinShards, "number of min shards")
+	totalShards := flag.Int("totalShards", api.DefaultRedundancySettings.TotalShards, "number of shards")
+
+	// node settings
+	busAddr := flag.String("busAddr", "http://127.0.0.1:9980/api/bus", "bus address")
+	busPassw := flag.String("busPassw", "test", "bus password")
+	workerAddrs := flag.String("workerAddrs", "http://127.0.0.1:9980/api/worker", "comma separated list of worker addresses")
+	workerPasswords := flag.String("workerPassws", "test", "comma separated list of worker passwords")
+
 	flag.Parse()
 
-	// parse data dir
-	if !filepath.IsAbs(*dataDir) {
-		curr, err := os.Getwd()
-		if err != nil {
-			log.Fatal("failed to get current working directory, err: ", err)
+	var threads []int
+	for _, t := range strings.Split(*dlThreadsStr, ",") {
+		if tt, err := strconv.Atoi(t); err != nil {
+			log.Fatalf("invalid thread count: %v", t)
+		} else {
+			threads = append(threads, tt)
 		}
-		*dataDir = filepath.Join(curr, *dataDir)
-	}
-
-	// ensure it exists
-	err := os.MkdirAll(*dataDir, 0777)
-	if err != nil {
-		log.Fatal("failed to ensure data directory exists, err: ", err)
-	}
-
-	// load renter key
-	renterKey, generated, err := loadRenterKey(*dataDir)
-	if err != nil {
-		log.Fatal("failed to load key, err: ", err)
 	}
 
 	return flags{
-		*contracts,
-		*dataDir,
-		*files,
-		*minShards,
-		*numShards,
-		*renterdAddr,
-		*renterdPassword,
-		*renterKey,
-	}, generated
+		id:          *id,
+		filesize:    int64(*fileSize),
+		numFiles:    *numFiles,
+		minShards:   *minShards,
+		totalShards: *totalShards,
+		dlThreads:   threads,
+		ulThreads:   *ulThreads,
+		bgUploads:   *bgUploads,
+
+		workerAddresses: strings.Split(*workerAddrs, ","),
+		workerPasswords: strings.Split(*workerPasswords, ","),
+
+		busAddress:  *busAddr,
+		busPassword: *busPassw,
+	}
 }
 
-func loadRenterKey(dataDir string) (*api.PrivateKey, bool, error) {
-	path := filepath.Join(dataDir, "renter.key")
+func main() {
+	flags := parseFlags()
 
-	// generate random key
-	f, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		key, err := randomRenterKey(path)
-		return key, true, err
-	} else if err != nil {
-		return nil, false, err
+	printHeader("RENTERD benchmarking tool")
+
+	// validate flags
+	if strings.HasSuffix(flags.id, "/") {
+		log.Fatal("benchmark id cannot end with '/'")
 	}
-	defer f.Close()
-
-	// read bytes
-	b, err := ioutil.ReadAll(f)
-	if err != nil {
-		return nil, false, err
+	if flags.busAddress == "" || flags.busPassword == "" {
+		log.Fatal("no bus credentials provided")
+	}
+	if len(flags.workerAddresses) == 0 {
+		log.Fatal("no workers provided")
+	}
+	if len(flags.workerAddresses) != len(flags.workerPasswords) {
+		log.Fatal("number of worker addresses does not match number of worker passwords")
 	}
 
-	// unmarshal into key
-	var key api.PrivateKey
-	err = key.UnmarshalText(b)
-	return &key, false, err
+	// print configuration
+	println("- benchmark: ", flags.id)
+	println("- filesize: ", humanReadableByteCount(flags.filesize))
+	println("- num files: ", flags.numFiles)
+	println("- num dl threads: ", fmt.Sprint(flags.dlThreads))
+	println("- num ul threads: ", fmt.Sprint(flags.ulThreads))
+	println("- min shards: ", flags.minShards)
+	println("- tot shards: ", flags.totalShards)
+	println()
+	println("- workers: ", strings.Join(flags.workerAddresses, ","))
+	println("- bus: ", flags.busAddress)
+	println()
+
+	// create bus client
+	bc := bus.NewClient(flags.busAddress, flags.busPassword)
+
+	// create worker clients
+	wcs := make([]*worker.Client, len(flags.workerAddresses))
+	for i, addr := range flags.workerAddresses {
+		wcs[i] = worker.NewClient(addr, flags.workerPasswords[i])
+	}
+	wc := wcs[0]
+
+	// create redundancy settings
+	rs := api.RedundancySettings{MinShards: flags.minShards, TotalShards: flags.totalShards}
+	if err := rs.Validate(); err != nil {
+		log.Fatal("invalid redundancy settings: ", err)
+	}
+
+	prefix := fmt.Sprintf("/%s/file_%v_", flags.id, strings.ReplaceAll(humanReadableByteCount(flags.filesize), " ", ""))
+	twentyPct := uint64(math.Ceil(float64(flags.numFiles) / 5))
+
+	checkConfig(bc, rs, wcs)
+	checkDataset(wc, flags.id, prefix, flags.ulThreads, flags.numFiles, flags.filesize, rs)
+
+	printHeader("running benchmark")
+
+	// run the benchmark for every thread count
+	for _, threadCount := range flags.dlThreads {
+		printSubHeader(fmt.Sprintf("thread count %d", threadCount))
+
+		// create a list of timings
+		timings := make([]float64, flags.numFiles)
+
+		// create a thread pool
+		threadPool := make(chan struct{}, threadCount)
+		for i := 0; i < threadCount; i++ {
+			threadPool <- struct{}{}
+		}
+
+		batchStart := time.Now()
+		var atomicDownloadsFinished uint64
+		var atomicDownloadErrors uint64
+		var wg sync.WaitGroup
+		for i := 0; i < flags.numFiles; i++ {
+			<-threadPool
+
+			wg.Add(1)
+			go func(i int) {
+				defer func() {
+					threadPool <- struct{}{}
+				}()
+				defer wg.Done()
+
+				start := time.Now()
+
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+				defer cancel()
+
+				err := wc.DownloadObject(ctx, io.Discard, strings.TrimPrefix(prefix+fmt.Sprint(i), "/"))
+				if err != nil {
+					log.Print(err)
+					atomic.AddUint64(&atomicDownloadErrors, 1)
+					return
+				}
+
+				timings[i] = float64(time.Since(start).Milliseconds())
+
+				numFinished := atomic.AddUint64(&atomicDownloadsFinished, 1)
+				if numFinished%twentyPct == 0 {
+					log.Printf("%v%% finished after %vms\n", (numFinished/twentyPct)*20, time.Since(start).Milliseconds())
+				}
+			}(i)
+		}
+		wg.Wait()
+
+		if atomicDownloadErrors != 0 {
+			log.Printf("there were %v errors while downloading\n", atomicDownloadErrors)
+		}
+		log.Println(percentiles(timings))
+
+		elapsed := time.Since(batchStart)
+		totalsize := int64(flags.numFiles) * flags.filesize
+		log.Printf("downloaded %v in %v (%v mpbs)\n", humanReadableByteCount(totalsize), elapsed.Round(time.Millisecond), mbps(totalsize, elapsed.Seconds()))
+	}
+}
+
+func checkConfig(bc *bus.Client, rs api.RedundancySettings, wcs []*worker.Client) {
+	printHeader("checking config")
+	defer log.Println("OK")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// check downloads
+	if dp, err := bc.DownloadParams(ctx); err != nil {
+		log.Fatal("failed to get dl params from the bus", err)
+	} else if dp.ContractSet == "" {
+		log.Fatal("bus does not have a contract set configured")
+	} else if cs, err := bc.Contracts(ctx, dp.ContractSet); err != nil {
+		log.Fatal("failed to fetch contracts for download contract set", err)
+	} else if len(cs) < rs.MinShards {
+		log.Fatal("not enough contracts to satisfy the redundancy settings")
+	}
+
+	// check uploads
+	if up, err := bc.UploadParams(ctx); err != nil {
+		log.Fatal("failed to get dl params from the bus", err)
+	} else if up.ContractSet == "" {
+		log.Fatal("bus does not have a contract set configured")
+	} else if cs, err := bc.Contracts(ctx, up.ContractSet); err != nil {
+		log.Fatal("failed to fetch contracts for download contract set", err)
+	} else if len(cs) < rs.TotalShards {
+		log.Fatal("not enough contracts to satisfy the redundancy settings")
+	}
+
+	// check accounts
+	for _, wc := range wcs {
+		if workerID, err := wc.ID(ctx); err != nil {
+			log.Fatal("failed to get worker id", err)
+		} else if accounts, err := bc.Accounts(ctx, workerID); err != nil {
+			log.Fatalf("failed to get account for worker %v, err: %v", workerID, err)
+		} else if len(accounts) < rs.MinShards {
+			log.Fatalf("worker %v does not have enough accounts to satisfy the redundancy settings", workerID)
+		}
+	}
+}
+
+func checkDataset(wc *worker.Client, path, prefix string, threads, required int, filesize int64, rs api.RedundancySettings) {
+	printHeader("checking dataset")
+	defer log.Println("OK")
+
+	filter := func(entries []string) []string {
+		filtered := entries[:0]
+		for _, entry := range entries {
+			if strings.HasPrefix(entry, prefix) {
+				filtered = append(filtered, entry)
+			}
+		}
+		return filtered
+	}
+
+	// check dataset
+	if entries, err := wc.ObjectEntries(context.Background(), path+"/"); err != nil && !strings.Contains(err.Error(), "object not found") {
+		log.Fatal("failed to fetch entries for path: '", path, "/', err: ", err)
+	} else if len(filter(entries)) < required {
+		// build a map of existing files
+		exists := make(map[string]bool)
+		for _, entry := range filter(entries) {
+			exists[entry] = true
+		}
+
+		// build a list of missing indices
+		missing := make([]int, 0)
+		for i := 0; i < required; i++ {
+			if !exists[prefix+fmt.Sprint(i)] {
+				missing = append(missing, i)
+			}
+		}
+		log.Printf("uploading %d missing files\n\n", len(missing))
+
+		// create a thread pool
+		threadPool := make(chan struct{}, threads)
+		for i := 0; i < threads; i++ {
+			threadPool <- struct{}{}
+		}
+
+		// upload missing files
+		var wg sync.WaitGroup
+		for _, i := range missing {
+			<-threadPool
+
+			wg.Add(1)
+			go func(index int) {
+				defer func() {
+					threadPool <- struct{}{}
+				}()
+				defer wg.Done()
+
+				start := time.Now()
+				path := fmt.Sprintf("%s?minshards=%v&totalshards=%v", strings.TrimPrefix(prefix+fmt.Sprint(index), "/"), rs.MinShards, rs.TotalShards)
+				if err := wc.UploadObject(context.Background(), randomFile(filesize), path); err != nil {
+					log.Fatal("failed to upload object, err: ", err)
+				}
+
+				elapsed := time.Since(start)
+				totalSize := int64(float64(filesize) * rs.Redundancy())
+				mbps := mbps(totalSize, float64(elapsed.Seconds()))
+				log.Printf("upload finished in %v (%v mbps)\n", elapsed.Round(time.Millisecond), mbps)
+			}(i)
+		}
+		wg.Wait()
+	}
+}
+
+func randomFile(filesize int64) io.Reader {
+	data := make([]byte, filesize)
+	if _, err := frand.Read(data); err != nil {
+		log.Fatal(err)
+	}
+	return bytes.NewReader(data)
+}
+
+func mbps(b int64, s float64) float64 {
+	bps := float64(b) / s
+	return math.Round(bps*0.000008*100) / 100
+}
+
+func humanReadableByteCount(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB",
+		float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+func percentiles(timings stats.Float64Data) string {
+	if len(timings) == 0 {
+		panic("developer error, no timings")
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("\nPercentile stats (%v timings):\n", len(timings)))
+	for _, p := range []float64{50, 80, 90, 99, 99.9} {
+		percentile, err := timings.Percentile(p)
+		if err != nil {
+			return err.Error()
+		}
+		sb.WriteString(fmt.Sprintf("%vp: %vms\n", p, percentile))
+	}
+
+	return sb.String()
+}
+
+func printHeader(h string) {
+	log.Printf("\n============================\n")
+	log.Println(" " + h)
+	log.Printf("============================\n\n")
+}
+
+func printSubHeader(h string) {
+	log.Printf("- - - - - - - - - - - - - - -\n")
+	log.Println(" " + h)
+	log.Printf("- - - - - - - - - - - - - - -\n\n")
 }
