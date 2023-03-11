@@ -2,7 +2,11 @@ module go.sia.tech/renterd-benchmark
 
 go 1.17
 
-require go.sia.tech/renterd v0.0.0-20230310095113-fea4207e88b6
+require (
+	github.com/montanaflynn/stats v0.7.0
+	go.sia.tech/renterd v0.0.0-20230310160446-ef5970d56dd6
+	lukechampine.com/frand v1.4.2
+)
 
 require (
 	github.com/aead/chacha20 v0.0.0-20180709150244-8b13a72661da // indirect
@@ -17,7 +21,6 @@ require (
 	github.com/julienschmidt/httprouter v1.3.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.3 // indirect
 	github.com/klauspost/reedsolomon v1.11.7 // indirect
-	github.com/montanaflynn/stats v0.7.0 // indirect
 	gitlab.com/NebulousLabs/bolt v1.4.4 // indirect
 	gitlab.com/NebulousLabs/encoding v0.0.0-20200604091946-456c3dc907fe // indirect
 	gitlab.com/NebulousLabs/entropy-mnemonics v0.0.0-20181018051301-7532f67e3500 // indirect
@@ -54,5 +57,4 @@ require (
 	google.golang.org/genproto v0.0.0-20221118155620-16455021b5e6 // indirect
 	google.golang.org/grpc v1.52.0 // indirect
 	google.golang.org/protobuf v1.28.1 // indirect
-	lukechampine.com/frand v1.4.2 // indirect
 )
