@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,13 +46,13 @@ func parseFlags() flags {
 
 	// benchmark settings
 	id := flag.String("id", "renterd-benchmark", "benchmark identifier")
-	fileSize := flag.Int("fileSize", 40<<20, "size of files to upload")
-	numFiles := flag.Int("numFiles", 100, "number of files in the dataset")
-	ulThreads := flag.Int("uploaderThreads", 1, "number of threads the uploader uses")
+	fileSize := flag.Int("size", 40<<20, "size of files to upload")
+	numFiles := flag.Int("files", 100, "number of files in the dataset")
 	dlThreadsStr := flag.String("threads", "1,4,16", "comma separated list of thread counts")
-	bgUploads := flag.Bool("bgUploads", false, "upload small files in the background while performing download benchmarks")
-	minShards := flag.Int("minShards", api.DefaultRedundancySettings.MinShards, "number of min shards")
-	totalShards := flag.Int("totalShards", api.DefaultRedundancySettings.TotalShards, "number of shards")
+	ulThreads := flag.Int("ul-threads", 1, "number of threads the uploader uses")
+	bgUploads := flag.Bool("ul-background", false, "upload small files in the background while performing download benchmarks")
+	minShards := flag.Int("min-shards", api.DefaultRedundancySettings.MinShards, "number of min shards")
+	totalShards := flag.Int("total-shards", api.DefaultRedundancySettings.TotalShards, "number of shards")
 
 	// node settings
 	busAddr := flag.String("busAddr", "http://127.0.0.1:9980/api/bus", "bus address")
@@ -91,8 +92,6 @@ func parseFlags() flags {
 func main() {
 	flags := parseFlags()
 
-	printHeader("RENTERD benchmarking tool")
-
 	// validate flags
 	if strings.HasSuffix(flags.id, "/") {
 		log.Fatal("benchmark id cannot end with '/'")
@@ -107,18 +106,46 @@ func main() {
 		log.Fatal("number of worker addresses does not match number of worker passwords")
 	}
 
+	stdout := os.Stdout
+	stderr := os.Stderr
+	defer func() {
+		os.Stdout = stdout
+		os.Stderr = stderr
+		log.SetOutput(os.Stderr)
+	}()
+
+	// create multiwriter to capture output
+	var buf bytes.Buffer
+	mw := io.MultiWriter(stdout, &buf)
+
+	// create a pipe and replace stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	os.Stderr = w
+	log.SetOutput(mw)
+
+	// create channel to control when we can return (after copying is finished)
+	exit := make(chan bool)
+	go func() {
+		_, _ = io.Copy(mw, r)
+		fmt.Println("DONE")
+		exit <- true
+	}()
+
+	printHeader("RENTERD benchmarking tool")
+
 	// print configuration
-	println("- benchmark: ", flags.id)
-	println("- filesize: ", humanReadableByteCount(flags.filesize))
-	println("- num files: ", flags.numFiles)
-	println("- num dl threads: ", fmt.Sprint(flags.dlThreads))
-	println("- num ul threads: ", fmt.Sprint(flags.ulThreads))
-	println("- min shards: ", flags.minShards)
-	println("- tot shards: ", flags.totalShards)
-	println()
-	println("- workers: ", strings.Join(flags.workerAddresses, ","))
-	println("- bus: ", flags.busAddress)
-	println()
+	log.Println("- benchmark: ", flags.id)
+	log.Println("- filesize: ", humanReadableByteCount(flags.filesize))
+	log.Println("- num files: ", flags.numFiles)
+	log.Println("- num dl threads: ", fmt.Sprint(flags.dlThreads))
+	log.Println("- num ul threads: ", fmt.Sprint(flags.ulThreads))
+	log.Println("- min shards: ", flags.minShards)
+	log.Println("- tot shards: ", flags.totalShards)
+	log.Println()
+	log.Println("- workers: ", strings.Join(flags.workerAddresses, ","))
+	log.Println("- bus: ", flags.busAddress)
+	log.Println()
 
 	// create bus client
 	bc := bus.NewClient(flags.busAddress, flags.busPassword)
@@ -171,23 +198,21 @@ func main() {
 				}()
 				defer wg.Done()
 
-				start := time.Now()
-
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 				defer cancel()
 
+				start := time.Now()
 				err := wc.DownloadObject(ctx, io.Discard, strings.TrimPrefix(prefix+fmt.Sprint(i), "/"))
 				if err != nil {
 					log.Print(err)
 					atomic.AddUint64(&atomicDownloadErrors, 1)
 					return
 				}
-
 				timings[i] = float64(time.Since(start).Milliseconds())
 
 				numFinished := atomic.AddUint64(&atomicDownloadsFinished, 1)
 				if numFinished%twentyPct == 0 {
-					log.Printf("%v%% finished after %vms\n", (numFinished/twentyPct)*20, time.Since(start).Milliseconds())
+					log.Printf("%v%% finished after %vms (%v mpbs)\n", (numFinished/twentyPct)*20, time.Since(batchStart).Milliseconds(), mbps(int64(numFinished)*flags.filesize, time.Since(batchStart).Seconds()))
 				}
 			}(i)
 		}
@@ -200,8 +225,29 @@ func main() {
 
 		elapsed := time.Since(batchStart)
 		totalsize := int64(flags.numFiles) * flags.filesize
-		log.Printf("downloaded %v in %v (%v mpbs)\n", humanReadableByteCount(totalsize), elapsed.Round(time.Millisecond), mbps(totalsize, elapsed.Seconds()))
+		log.Printf("downloaded %v in %v (%v mpbs)\n\n", humanReadableByteCount(totalsize), elapsed.Round(time.Millisecond), mbps(totalsize, elapsed.Seconds()))
 	}
+
+	_ = w.Close()
+	<-exit
+
+	printHeader("generating report")
+
+	filename := fmt.Sprintf("benchmark_%s_%s.txt", flags.id, time.Now().Format("2006-01-02_15-04-05"))
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Println("ERR: failed to open output to file", err)
+		return
+	}
+
+	_, err = file.Write(buf.Bytes())
+	if err != nil {
+		log.Println("ERR: failed to write output to file", err)
+		return
+	}
+	file.Sync()
+	file.Close()
+	log.Println("report written to", filename)
 }
 
 func checkConfig(bc *bus.Client, rs api.RedundancySettings, wcs []*worker.Client) {
@@ -345,7 +391,7 @@ func percentiles(timings stats.Float64Data) string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("\nPercentile stats (%v timings):\n", len(timings)))
+	sb.WriteString(fmt.Sprintf("\npercentile stats (%v timings):\n\n", len(timings)))
 	for _, p := range []float64{50, 80, 90, 99, 99.9} {
 		percentile, err := timings.Percentile(p)
 		if err != nil {
