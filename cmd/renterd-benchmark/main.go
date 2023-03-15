@@ -50,7 +50,7 @@ func parseFlags() flags {
 	numFiles := flag.Int("files", 100, "number of files in the dataset")
 	dlThreadsStr := flag.String("threads", "1,4,16", "comma separated list of thread counts")
 	ulThreads := flag.Int("ul-threads", 1, "number of threads the uploader uses")
-	bgUploads := flag.Bool("ul-background", false, "upload small files in the background while performing download benchmarks")
+	bgUploads := flag.Bool("background-ul", false, "upload small files in the background while performing download benchmarks")
 	minShards := flag.Int("min-shards", api.DefaultRedundancySettings.MinShards, "number of min shards")
 	totalShards := flag.Int("total-shards", api.DefaultRedundancySettings.TotalShards, "number of shards")
 
@@ -64,7 +64,7 @@ func parseFlags() flags {
 
 	var threads []int
 	for _, t := range strings.Split(*dlThreadsStr, ",") {
-		if tt, err := strconv.Atoi(t); err != nil {
+		if tt, err := strconv.Atoi(strings.TrimSpace(t)); err != nil {
 			log.Fatalf("invalid thread count: %v", t)
 		} else {
 			threads = append(threads, tt)
@@ -106,148 +106,130 @@ func main() {
 		log.Fatal("number of worker addresses does not match number of worker passwords")
 	}
 
-	stdout := os.Stdout
-	stderr := os.Stderr
-	defer func() {
-		os.Stdout = stdout
-		os.Stderr = stderr
-		log.SetOutput(os.Stderr)
-	}()
+	// run the benchmark
+	filename := fmt.Sprintf("benchmark_%s_%s.txt", flags.id, time.Now().Format("2006-01-02_15-04-05"))
+	report(filename, capture(func() { benchmark(flags) }))
+}
 
-	// create multiwriter to capture output
-	var buf bytes.Buffer
-	mw := io.MultiWriter(stdout, &buf)
-
-	// create a pipe and replace stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-	os.Stderr = w
-	log.SetOutput(mw)
-
-	// create channel to control when we can return (after copying is finished)
-	exit := make(chan bool)
-	go func() {
-		_, _ = io.Copy(mw, r)
-		fmt.Println("DONE")
-		exit <- true
-	}()
-
+func benchmark(params flags) {
 	printHeader("RENTERD benchmarking tool")
 
 	// print configuration
-	log.Println("- benchmark: ", flags.id)
-	log.Println("- filesize: ", humanReadableByteCount(flags.filesize))
-	log.Println("- num files: ", flags.numFiles)
-	log.Println("- num dl threads: ", fmt.Sprint(flags.dlThreads))
-	log.Println("- num ul threads: ", fmt.Sprint(flags.ulThreads))
-	log.Println("- min shards: ", flags.minShards)
-	log.Println("- tot shards: ", flags.totalShards)
+	log.Println("- benchmark: ", params.id)
+	log.Println("- filesize: ", humanReadableByteCount(params.filesize))
+	log.Println("- num files: ", params.numFiles)
+	log.Println("- num dl threads: ", fmt.Sprint(params.dlThreads))
+	log.Println("- num ul threads: ", fmt.Sprint(params.ulThreads))
+	log.Println("- min shards: ", params.minShards)
+	log.Println("- tot shards: ", params.totalShards)
 	log.Println()
-	log.Println("- workers: ", strings.Join(flags.workerAddresses, ","))
-	log.Println("- bus: ", flags.busAddress)
+	log.Println("- workers: ", strings.Join(params.workerAddresses, ","))
+	log.Println("- bus: ", params.busAddress)
 	log.Println()
 
 	// create bus client
-	bc := bus.NewClient(flags.busAddress, flags.busPassword)
+	bc := bus.NewClient(params.busAddress, params.busPassword)
 
 	// create worker clients
-	wcs := make([]*worker.Client, len(flags.workerAddresses))
-	for i, addr := range flags.workerAddresses {
-		wcs[i] = worker.NewClient(addr, flags.workerPasswords[i])
+	wcs := make([]*worker.Client, len(params.workerAddresses))
+	for i, addr := range params.workerAddresses {
+		wcs[i] = worker.NewClient(addr, params.workerPasswords[i])
 	}
 	wc := wcs[0]
 
 	// create redundancy settings
-	rs := api.RedundancySettings{MinShards: flags.minShards, TotalShards: flags.totalShards}
+	rs := api.RedundancySettings{MinShards: params.minShards, TotalShards: params.totalShards}
 	if err := rs.Validate(); err != nil {
 		log.Fatal("invalid redundancy settings: ", err)
 	}
 
-	prefix := fmt.Sprintf("/%s/file_%v_", flags.id, strings.ReplaceAll(humanReadableByteCount(flags.filesize), " ", ""))
-	twentyPct := uint64(math.Ceil(float64(flags.numFiles) / 5))
+	prefix := fmt.Sprintf("/%s/file_%v_", params.id, strings.ReplaceAll(humanReadableByteCount(params.filesize), " ", ""))
 
 	checkConfig(bc, rs, wcs)
-	checkDataset(wc, flags.id, prefix, flags.ulThreads, flags.numFiles, flags.filesize, rs)
+	checkDataset(wc, params.id, prefix, params.ulThreads, params.numFiles, params.filesize, rs)
 
 	printHeader("running benchmark")
 
+	// start uploading in the background if requested
+	if params.bgUploads {
+		printSubHeader("start background uploads")
+		doneChan := make(chan struct{})
+		defer close(doneChan)
+		go uploadRandomData(wcs, 4<<20, doneChan)
+	}
+
 	// run the benchmark for every thread count
-	for _, threadCount := range flags.dlThreads {
+	for _, threadCount := range params.dlThreads {
 		printSubHeader(fmt.Sprintf("thread count %d", threadCount))
 
-		// create a list of timings
-		timings := make([]float64, flags.numFiles)
+		timings, elapsed, _, failures := parallelize(threadCount, params.numFiles, func(i int) error {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
 
-		// create a thread pool
-		threadPool := make(chan struct{}, threadCount)
-		for i := 0; i < threadCount; i++ {
-			threadPool <- struct{}{}
-		}
+			wc := wcs[0]
+			for _, wc = range wcs {
+				break
+			}
 
-		batchStart := time.Now()
-		var atomicDownloadsFinished uint64
-		var atomicDownloadErrors uint64
-		var wg sync.WaitGroup
-		for i := 0; i < flags.numFiles; i++ {
-			<-threadPool
+			return wc.DownloadObject(ctx, io.Discard, strings.TrimPrefix(prefix+fmt.Sprint(i), "/"))
+		}, .2, func(progress float64, elapsed time.Duration, success, _ uint64) {
+			log.Printf("%v%% finished after %vms (%v mpbs)\n", progress*100, elapsed.Milliseconds(), mbps(int64(success)*params.filesize, elapsed.Seconds()))
+		})
 
-			wg.Add(1)
-			go func(i int) {
-				defer func() {
-					threadPool <- struct{}{}
-				}()
-				defer wg.Done()
-
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-				defer cancel()
-
-				start := time.Now()
-				err := wc.DownloadObject(ctx, io.Discard, strings.TrimPrefix(prefix+fmt.Sprint(i), "/"))
-				if err != nil {
-					log.Print(err)
-					atomic.AddUint64(&atomicDownloadErrors, 1)
-					return
-				}
-				timings[i] = float64(time.Since(start).Milliseconds())
-
-				numFinished := atomic.AddUint64(&atomicDownloadsFinished, 1)
-				if numFinished%twentyPct == 0 {
-					log.Printf("%v%% finished after %vms (%v mpbs)\n", (numFinished/twentyPct)*20, time.Since(batchStart).Milliseconds(), mbps(int64(numFinished)*flags.filesize, time.Since(batchStart).Seconds()))
-				}
-			}(i)
-		}
-		wg.Wait()
-
-		if atomicDownloadErrors != 0 {
-			log.Printf("there were %v errors while downloading\n", atomicDownloadErrors)
+		if failures != 0 {
+			log.Printf("there were %v errors while downloading\n", failures)
 		}
 		log.Println(percentiles(timings))
 
-		elapsed := time.Since(batchStart)
-		totalsize := int64(flags.numFiles) * flags.filesize
+		totalsize := int64(params.numFiles) * params.filesize
 		log.Printf("downloaded %v in %v (%v mpbs)\n\n", humanReadableByteCount(totalsize), elapsed.Round(time.Millisecond), mbps(totalsize, elapsed.Seconds()))
 	}
+}
 
-	_ = w.Close()
-	<-exit
+func parallelize(threads, n int, jobFn func(i int) error, progress float64, progressFn func(progress float64, elapsed time.Duration, success, failures uint64)) ([]float64, time.Duration, uint64, uint64) {
+	start := time.Now()
+	timings := make([]float64, n)
+	cutoff := uint64(math.Ceil(float64(n) * progress))
 
-	printHeader("generating report")
-
-	filename := fmt.Sprintf("benchmark_%s_%s.txt", flags.id, time.Now().Format("2006-01-02_15-04-05"))
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Println("ERR: failed to open output to file", err)
-		return
+	// create a thread pool
+	threadPool := make(chan struct{}, threads)
+	for i := 0; i < threads; i++ {
+		threadPool <- struct{}{}
 	}
 
-	_, err = file.Write(buf.Bytes())
-	if err != nil {
-		log.Println("ERR: failed to write output to file", err)
-		return
+	var success uint64
+	var failure uint64
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		<-threadPool
+
+		wg.Add(1)
+		go func(i int) {
+			defer func() {
+				threadPool <- struct{}{}
+			}()
+			defer wg.Done()
+
+			start := time.Now()
+			if err := jobFn(i); err != nil {
+				log.Println(err)
+				atomic.AddUint64(&failure, 1)
+			} else {
+				atomic.AddUint64(&success, 1)
+				timings[i] = float64(time.Since(start).Milliseconds())
+			}
+
+			success := atomic.LoadUint64(&success)
+			failure := atomic.LoadUint64(&failure)
+			if processed := success + failure; processed%cutoff == 0 {
+				progress := float64(processed) / float64(n)
+				progressFn(progress, time.Since(start), success, failure)
+			}
+		}(i)
 	}
-	file.Sync()
-	file.Close()
-	log.Println("report written to", filename)
+	wg.Wait()
+
+	return timings, time.Since(start), success, failure
 }
 
 func checkConfig(bc *bus.Client, rs api.RedundancySettings, wcs []*worker.Client) {
@@ -358,17 +340,39 @@ func checkDataset(wc *worker.Client, path, prefix string, threads, required int,
 	}
 }
 
-func randomFile(filesize int64) io.Reader {
-	data := make([]byte, filesize)
-	if _, err := frand.Read(data); err != nil {
-		log.Fatal(err)
-	}
-	return bytes.NewReader(data)
-}
+func capture(fn func()) string {
+	// backup stdout and stderr
+	stdout := os.Stdout
+	stderr := os.Stderr
+	defer func() {
+		os.Stdout = stdout
+		os.Stderr = stderr
+		log.SetOutput(os.Stderr)
+	}()
 
-func mbps(b int64, s float64) float64 {
-	bps := float64(b) / s
-	return math.Round(bps*0.000008*100) / 100
+	// create multiwriter to capture output
+	var buf bytes.Buffer
+	mw := io.MultiWriter(stdout, &buf)
+
+	// create a pipe and replace stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	os.Stderr = w
+	log.SetOutput(mw)
+
+	// create channel to control when we can return (after copying is finished)
+	exit := make(chan bool)
+	go func() {
+		_, _ = io.Copy(mw, r)
+		exit <- true
+	}()
+
+	fn()
+
+	_ = w.Close()
+	<-exit
+
+	return buf.String()
 }
 
 func humanReadableByteCount(b int64) string {
@@ -403,6 +407,11 @@ func percentiles(timings stats.Float64Data) string {
 	return sb.String()
 }
 
+func mbps(b int64, s float64) float64 {
+	bps := float64(b) / s
+	return math.Round(bps*0.000008*100) / 100
+}
+
 func printHeader(h string) {
 	log.Printf("\n============================\n")
 	log.Println(" " + h)
@@ -413,4 +422,57 @@ func printSubHeader(h string) {
 	log.Printf("- - - - - - - - - - - - - - -\n")
 	log.Println(" " + h)
 	log.Printf("- - - - - - - - - - - - - - -\n\n")
+}
+
+func randomFile(filesize int64) io.Reader {
+	data := make([]byte, filesize)
+	if _, err := frand.Read(data); err != nil {
+		log.Fatal(err)
+	}
+	return bytes.NewReader(data)
+}
+
+func randomPath() string {
+	b := make([]byte, 16)
+	frand.Read(b)
+	return fmt.Sprintf("%x", b)
+}
+
+func report(filename, output string) {
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatal("ERR: failed to open output to file", err)
+		return
+	}
+
+	_, err = file.WriteString(output)
+	if err != nil {
+		log.Fatal("ERR: failed to write output to file", err)
+		return
+	}
+	file.Sync()
+	file.Close()
+
+	log.Println("report written to", filename)
+}
+
+func uploadRandomData(wcs []*worker.Client, filesize int64, stopChan chan struct{}) {
+	for {
+		select {
+		case <-stopChan:
+			return
+		default:
+		}
+
+		wc := wcs[0]
+		for _, wc = range wcs {
+			break
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		if err := wc.UploadObject(ctx, randomFile(filesize), randomPath()); err != nil {
+			log.Println("ERR: background upload failed, err: ", err)
+		}
+		cancel()
+	}
 }
