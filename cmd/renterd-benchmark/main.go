@@ -306,7 +306,7 @@ func checkDataset(wc *worker.Client, path, prefix string, threads, required int,
 	}
 
 	// check dataset
-	if entries, err := wc.ObjectEntries(context.Background(), path+"/"); err != nil && !strings.Contains(err.Error(), "object not found") {
+	if entries, err := wc.ObjectEntries(context.Background(), path+"/"); err != nil {
 		log.Fatal("failed to fetch entries for path: '", path, "/', err: ", err)
 	} else if len(filter(entries)) < required {
 		// build a map of existing files
