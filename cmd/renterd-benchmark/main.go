@@ -210,13 +210,13 @@ func parallelize(threads, n int, jobFn func(i int) error, progress float64, prog
 			}()
 			defer wg.Done()
 
-			start := time.Now()
+			jobStart := time.Now()
 			if err := jobFn(i); err != nil {
 				log.Println(err)
 				atomic.AddUint64(&failure, 1)
 			} else {
 				atomic.AddUint64(&success, 1)
-				timings[i] = float64(time.Since(start).Milliseconds())
+				timings[i] = float64(time.Since(jobStart).Milliseconds())
 			}
 
 			success := atomic.LoadUint64(&success)
