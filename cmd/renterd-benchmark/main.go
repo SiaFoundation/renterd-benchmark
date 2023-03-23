@@ -162,7 +162,7 @@ func benchmark(params flags) {
 	for _, threadCount := range params.dlThreads {
 		printSubHeader(fmt.Sprintf("thread count %d", threadCount))
 
-		timings, elapsed, _, failures := parallelize(threadCount, params.numFiles, func(i int) error {
+		jobFn := func(i int) error {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
 
@@ -172,17 +172,19 @@ func benchmark(params flags) {
 			}
 
 			return wc.DownloadObject(ctx, io.Discard, strings.TrimPrefix(prefix+fmt.Sprint(i), "/"))
-		}, .2, func(progress float64, elapsed time.Duration, success, _ uint64) {
-			log.Printf("%v%% finished after %vms (%v mpbs)\n", progress*100, elapsed.Milliseconds(), mbps(int64(success)*params.filesize, elapsed.Seconds()))
-		})
+		}
+		progressFn := func(progress float64, elapsed time.Duration, success, _ uint64) {
+			log.Printf("%v%% finished after %v (%v mpbs)\n", progress*100, elapsed, mbps(int64(success)*params.filesize, elapsed.Seconds()))
+		}
 
+		timings, elapsed, _, failures := parallelize(threadCount, params.numFiles, jobFn, .2, progressFn)
 		if failures != 0 {
 			log.Printf("there were %v errors while downloading\n", failures)
 		}
 		log.Println(percentiles(timings))
 
-		totalsize := int64(params.numFiles) * params.filesize
-		log.Printf("downloaded %v in %v (%v mpbs)\n\n", humanReadableByteCount(totalsize), elapsed.Round(time.Millisecond), mbps(totalsize, elapsed.Seconds()))
+		downloaded := int64(params.numFiles) * params.filesize
+		log.Printf("downloaded %v in %v (%v mpbs)\n\n", humanReadableByteCount(downloaded), elapsed.Round(time.Millisecond), mbps(downloaded, elapsed.Seconds()))
 	}
 }
 
@@ -262,14 +264,10 @@ func checkConfig(bc *bus.Client, rs api.RedundancySettings, wcs []*worker.Client
 	}
 
 	// check accounts
-	for _, wc := range wcs {
-		if workerID, err := wc.ID(ctx); err != nil {
-			log.Fatal("failed to get worker id", err)
-		} else if accounts, err := bc.Accounts(ctx, workerID); err != nil {
-			log.Fatalf("failed to get account for worker %v, err: %v", workerID, err)
-		} else if len(accounts) < rs.MinShards {
-			log.Fatalf("worker %v does not have enough accounts to satisfy the redundancy settings", workerID)
-		}
+	if accounts, err := bc.Accounts(ctx); err != nil {
+		log.Fatalf("failed to get accounts, err: %v", err)
+	} else if len(accounts) < rs.MinShards {
+		log.Fatalf("not enough accounts to satisfy the redundancy settings")
 	}
 }
 

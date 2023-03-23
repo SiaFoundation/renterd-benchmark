@@ -4,7 +4,7 @@ go 1.17
 
 require (
 	github.com/montanaflynn/stats v0.7.0
-	go.sia.tech/renterd v0.0.0-20230310160446-ef5970d56dd6
+	go.sia.tech/renterd v0.0.0-20230322170823-e0b071208fa7
 	lukechampine.com/frand v1.4.2
 )
 
