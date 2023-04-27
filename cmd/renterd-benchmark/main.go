@@ -31,7 +31,7 @@ type (
 		totalShards int
 		dlThreads   []int
 		ulThreads   int
-		bgUploads   bool
+		ulBgThreads int
 
 		workerAddresses []string
 		workerPasswords []string
@@ -50,7 +50,7 @@ func parseFlags() flags {
 	numFiles := flag.Int("files", 100, "number of files in the dataset")
 	dlThreadsStr := flag.String("threads", "1,4,16", "comma separated list of thread counts")
 	ulThreads := flag.Int("ul-threads", 1, "number of threads the uploader uses")
-	bgUploads := flag.Bool("background-ul", false, "upload small files in the background while performing download benchmarks")
+	ulBgThreads := flag.Int("ul-bg-threads", 0, "number of background upload threads to run while performing download benchmarks")
 	minShards := flag.Int("min-shards", api.DefaultRedundancySettings.MinShards, "number of min shards")
 	totalShards := flag.Int("total-shards", api.DefaultRedundancySettings.TotalShards, "number of shards")
 
@@ -79,7 +79,7 @@ func parseFlags() flags {
 		totalShards: *totalShards,
 		dlThreads:   threads,
 		ulThreads:   *ulThreads,
-		bgUploads:   *bgUploads,
+		ulBgThreads: *ulBgThreads,
 
 		workerAddresses: strings.Split(*workerAddrs, ","),
 		workerPasswords: strings.Split(*workerPasswords, ","),
@@ -151,11 +151,13 @@ func benchmark(params flags) {
 	printHeader("running benchmark")
 
 	// start uploading in the background if requested
-	if params.bgUploads {
-		printSubHeader("start background uploads")
+	if params.ulBgThreads > 0 {
+		printSubHeader(fmt.Sprintf("start %d background upload threads", params.ulBgThreads))
 		doneChan := make(chan struct{})
 		defer close(doneChan)
-		go uploadRandomData(wcs, 4<<20, doneChan)
+		for i := 0; i < params.ulBgThreads; i++ {
+			go uploadRandomData(wcs, 4<<20, doneChan)
+		}
 	}
 
 	// run the benchmark for every thread count
@@ -285,13 +287,21 @@ func checkDataset(wc *worker.Client, path, prefix string, threads, required int,
 		return filtered
 	}
 
+	flatten := func(entries []api.ObjectMetadata) []string {
+		flattened := make([]string, len(entries))
+		for i, entry := range entries {
+			flattened[i] = entry.Name
+		}
+		return flattened
+	}
+
 	// check dataset
 	if entries, err := wc.ObjectEntries(context.Background(), path+"/"); err != nil {
 		log.Fatal("failed to fetch entries for path: '", path, "/', err: ", err)
-	} else if len(filter(entries)) < required {
+	} else if len(filter(flatten(entries))) < required {
 		// build a map of existing files
 		exists := make(map[string]bool)
-		for _, entry := range filter(entries) {
+		for _, entry := range filter(flatten(entries)) {
 			exists[entry] = true
 		}
 
