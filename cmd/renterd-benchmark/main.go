@@ -66,7 +66,7 @@ func parseFlags() flags {
 	for _, t := range strings.Split(*dlThreadsStr, ",") {
 		if tt, err := strconv.Atoi(strings.TrimSpace(t)); err != nil {
 			log.Fatalf("invalid thread count: %v", t)
-		} else {
+		} else if tt > 0 {
 			threads = append(threads, tt)
 		}
 	}
