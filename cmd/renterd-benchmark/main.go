@@ -244,13 +244,9 @@ func checkConfig(bc *bus.Client, rs api.RedundancySettings, wcs []*worker.Client
 	defer cancel()
 
 	// check downloads
-	if dp, err := bc.DownloadParams(ctx); err != nil {
-		log.Fatal("failed to get dl params from the bus", err)
-	} else if dp.ContractSet == "" {
-		log.Fatal("bus does not have a contract set configured")
-	} else if cs, err := bc.Contracts(ctx, dp.ContractSet); err != nil {
-		log.Fatal("failed to fetch contracts for download contract set", err)
-	} else if len(cs) < rs.MinShards {
+	if acs, err := bc.ActiveContracts(ctx); err != nil {
+		log.Fatal("failed to get active contracts from the bus", err)
+	} else if len(acs) < rs.MinShards {
 		log.Fatal("not enough contracts to satisfy the redundancy settings")
 	}
 
