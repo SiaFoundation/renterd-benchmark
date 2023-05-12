@@ -244,7 +244,7 @@ func checkConfig(bc *bus.Client, rs api.RedundancySettings, wcs []*worker.Client
 	defer cancel()
 
 	// check downloads
-	if acs, err := bc.ActiveContracts(ctx); err != nil {
+	if acs, err := bc.Contracts(ctx); err != nil {
 		log.Fatal("failed to get active contracts from the bus", err)
 	} else if len(acs) < rs.MinShards {
 		log.Fatal("not enough contracts to satisfy the redundancy settings")
@@ -255,7 +255,7 @@ func checkConfig(bc *bus.Client, rs api.RedundancySettings, wcs []*worker.Client
 		log.Fatal("failed to get dl params from the bus", err)
 	} else if up.ContractSet == "" {
 		log.Fatal("bus does not have a contract set configured")
-	} else if cs, err := bc.Contracts(ctx, up.ContractSet); err != nil {
+	} else if cs, err := bc.ContractSetContracts(ctx, up.ContractSet); err != nil {
 		log.Fatal("failed to fetch contracts for download contract set", err)
 	} else if len(cs) < rs.TotalShards {
 		log.Fatal("not enough contracts to satisfy the redundancy settings")
@@ -438,7 +438,10 @@ func randomFile(filesize int64) io.Reader {
 
 func randomPath() string {
 	b := make([]byte, 16)
-	frand.Read(b)
+	_, err := frand.Read(b)
+	if err != nil {
+		panic("failed to generate random path")
+	}
 	return fmt.Sprintf("%x", b)
 }
 
@@ -454,8 +457,8 @@ func report(filename, output string) {
 		log.Fatal("ERR: failed to write output to file", err)
 		return
 	}
-	file.Sync()
-	file.Close()
+	_ = file.Sync()
+	_ = file.Close()
 
 	log.Println("report written to", filename)
 }
