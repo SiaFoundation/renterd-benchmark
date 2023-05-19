@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -45,7 +46,7 @@ func parseFlags() flags {
 	log.SetFlags(0)
 
 	// benchmark settings
-	id := flag.String("id", "renterd-benchmark", "benchmark identifier")
+	id := flag.String("id", "", "benchmark identifier")
 	fileSize := flag.Int("size", 40<<20, "size of files to upload")
 	numFiles := flag.Int("files", 100, "number of files in the dataset")
 	dlThreadsStr := flag.String("threads", "1,4,16", "comma separated list of thread counts")
@@ -69,6 +70,13 @@ func parseFlags() flags {
 		} else if tt > 0 {
 			threads = append(threads, tt)
 		}
+	}
+
+	// generate random id if none was given
+	if *id == "" {
+		r := make([]byte, 8)
+		frand.Read(r)
+		*id = hex.EncodeToString(r)
 	}
 
 	return flags{
@@ -308,7 +316,7 @@ func checkDataset(wc *worker.Client, path, prefix string, threads, required int,
 				missing = append(missing, i)
 			}
 		}
-		log.Printf("uploading %d missing files\n\n", len(missing))
+		log.Printf("uploading %d missing files...\n\n", len(missing))
 
 		// create a thread pool
 		threadPool := make(chan struct{}, threads)
@@ -316,6 +324,7 @@ func checkDataset(wc *worker.Client, path, prefix string, threads, required int,
 			threadPool <- struct{}{}
 		}
 
+		timings := make([]float64, 0)
 		// upload missing files
 		var wg sync.WaitGroup
 		for _, i := range missing {
@@ -337,10 +346,19 @@ func checkDataset(wc *worker.Client, path, prefix string, threads, required int,
 				elapsed := time.Since(start)
 				totalSize := int64(float64(filesize) * rs.Redundancy())
 				mbps := mbps(totalSize, float64(elapsed.Seconds()))
+				timings = append(timings, mbps)
 				log.Printf("upload finished in %v (%v mbps)\n", elapsed.Round(time.Millisecond), mbps)
 			}(i)
 		}
 		wg.Wait()
+
+		if len(timings) > 0 {
+			var sum float64
+			for _, t := range timings {
+				sum += t
+			}
+			log.Printf("average upload speed %v mbps\n", sum/float64(len(timings)))
+		}
 	}
 }
 
