@@ -248,7 +248,7 @@ func checkConfig(bc *bus.Client, rs api.RedundancySettings, wcs []*worker.Client
 	printHeader("checking config")
 	defer log.Println("OK")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	// check downloads
