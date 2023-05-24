@@ -324,6 +324,7 @@ func checkDataset(wc *worker.Client, path, prefix string, threads, required int,
 			threadPool <- struct{}{}
 		}
 
+		var cnt uint64
 		timings := make([]float64, 0)
 		// upload missing files
 		var wg sync.WaitGroup
@@ -347,7 +348,7 @@ func checkDataset(wc *worker.Client, path, prefix string, threads, required int,
 				totalSize := int64(float64(filesize) * rs.Redundancy())
 				mbps := mbps(totalSize, float64(elapsed.Seconds()))
 				timings = append(timings, mbps)
-				log.Printf("upload finished in %v (%v mbps)\n", elapsed.Round(time.Millisecond), mbps)
+				log.Printf("upload %d/%d finished in %v (%v mbps)\n", atomic.AddUint64(&cnt, 1), len(missing), elapsed.Round(time.Millisecond), mbps)
 			}(i)
 		}
 		wg.Wait()
